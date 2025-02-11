@@ -38,7 +38,7 @@ DAYS_TO_EXPIRATION = get_days_to_expiration()  # Target days to expiration
 DELTA_TARGET = 0.30  # Target delta for options
 
 # Stock Filtering Parameters
-MIN_STOCK_PRICE = 5.0  # Minimum stock price
+MIN_STOCK_PRICE = 25.0  # Minimum stock price
 MIN_VOLUME = 1000000  # Minimum daily volume
 MIN_MARKET_CAP = 1000000000  # Minimum market cap ($1B)
 
@@ -255,7 +255,7 @@ class OptionsTradeExecutor:
 
         return round(price, 2)
 
-    def place_options_trade(self, symbol: str, price: float, direction: str) -> bool:
+    def place_options_trade(self, symbol: str, price: float, direction: str, strike: float) -> bool:
         """Place options trade based on market conditions"""
         try:
             # Determine trade direction based on market conditions
@@ -268,7 +268,8 @@ class OptionsTradeExecutor:
             contract_symbol, contract_price, strike_price = self.select_option_contract(
                 symbol, 
                 price, 
-                is_bullish
+                is_bullish,
+                strike
             )
             
             if not contract_symbol or not contract_price:
@@ -320,20 +321,20 @@ class OptionsTradeExecutor:
             return False
 
 
-    def select_option_contract(self, symbol: str, current_price: float, is_bullish: bool) -> Tuple[str, float, float]:
+    def select_option_contract(self, symbol: str, current_price: float, is_bullish: bool,strike: float) -> Tuple[str, float, float]:
         """Select appropriate option contract with valid expiration"""
         try:
             # Get next valid expiration
             next_expiry = self.get_next_valid_expiry()
             
             # Get nearest strikes
-            strikes = self.find_nearest_strikes(current_price)
+            #strikes = self.find_nearest_strikes(current_price)
             
             # Select strike based on direction
-            if is_bullish:
-                strike = max([s for s in strikes if s <= current_price])
-            else:
-                strike = min([s for s in strikes if s >= current_price])
+            #if is_bullish:
+                #strike = max([s for s in strikes if s <= current_price])
+            #else:
+                #strike = min([s for s in strikes if s >= current_price])
             
             # Calculate theoretical option price
             option_price = self.calculate_option_price(
@@ -377,6 +378,7 @@ class OptionsTradeExecutor:
                 symbol = stock['symbol']
                 price = stock['price']
                 direction = stock['direction']
+                nearest_strike = stock['nearest_strike']
                 
                 current_underlyings = self._get_current_underlyings()
                 if symbol in current_underlyings:
@@ -390,7 +392,7 @@ class OptionsTradeExecutor:
                     print(f"Skipping {symbol}: Price (${price:.2f}) below minimum (${MIN_STOCK_PRICE:.2f})")
                     continue
                 # Place new trades
-                trade_success = self.place_options_trade(symbol, price, direction)
+                trade_success = self.place_options_trade(symbol, price, direction,nearest_strike)
                 if trade_success:
                     # Record that this underlying has been traded today
                     self.traded_today.add(symbol)
@@ -401,7 +403,7 @@ def run_options_trading():
     """Main trading loop with proper error handling and scheduling"""
     executor = OptionsTradeExecutor()
     executor.run_trading_cycle()
-    schedule.every(30).minutes.do(executor.run_trading_cycle)
+    schedule.every(15).minutes.do(executor.run_trading_cycle)
     schedule.every(1).minutes.do(executor.monitor_positions)
     while True:
         try:

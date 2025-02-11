@@ -57,6 +57,56 @@ def get_top_active_stocks_alpha(top_n=10):
         return []
 
 
+def get_stock_data_alpha(symbols):
+    url = "https://www.alphavantage.co/query"
+
+    stock_data = []
+    for symbol in symbols:
+        params = {
+            "function": "TIME_SERIES_INTRADAY",
+            "symbol": symbol,
+            "interval": "5min",
+            "apikey": ALPHA_VANTAGE_API_KEY
+        }
+        response = requests.get(url, params=params)
+        data = response.json()
+
+        # Extracting the latest price and volume
+        try:
+            latest_time = max(data["Time Series (5min)"].keys())
+            latest_data = data["Time Series (5min)"][latest_time]
+            price = latest_data["4. close"]
+            volume = latest_data["5. volume"]
+            stock_data.append({"symbol": symbol, "price": price, "volume": volume})
+        except KeyError:
+            stock_data.append({"symbol": symbol, "error": "Data unavailable"})
+
+    return stock_data
+
+
+def get_stock_data(symbols):
+    stock_data = []
+    headers = {
+        'APCA-API-KEY-ID': ALPACA_API_KEY,
+        'APCA-API-SECRET-KEY': ALPACA_API_SECRET
+    }
+    for symbol in symbols:
+        endpoint = f"{MARKET_URL}/v2/stocks/{symbol}/quotes/latest"
+        response = requests.get(endpoint, headers=headers)
+        data = response.json()
+
+        # Extracting the latest price and volume
+        try:
+            price = data["quote"]["ap"]  # Ask price
+            volume = data["quote"]["as"]
+            stock_data.append({"symbol": symbol, "price": price, "volume": volume})
+        except KeyError:
+            stock_data.append({"symbol": symbol, "error": "Data unavailable"})
+
+        time.sleep(1)  # To avoid API rate limits
+
+    return stock_data
+
 def get_historical_data(symbol, timeframe='1D', limit=200):
     """Get historical data for a symbol using Alpaca's API."""
     retry_count = 0
@@ -232,23 +282,51 @@ def get_position_size(analysis, account_size, stock_price):
     return np.floor(position_size)
 
 
-def get_options_data(symbol):
-    """Fetch options data using yfinance and calculate IV percentile and put/call ratio."""
+def get_options_data(symbol, percentile=50):
+    """Fetch options data using yfinance and calculate IV percentile,
+    put/call ratio, and the nearest strike price relative to the current underlying price."""
     try:
         stock = yf.Ticker(symbol)
         if not stock.options:
             print(f"No available option expirations for {symbol}")
             return None
+
+        # Select the first (nearest) expiration
         expiry = stock.options[0]
         options_chain = stock.option_chain(expiry)
+
+        # Get the current underlying price (use regularMarketPrice if available)
+        underlying_price = stock.info.get("regularMarketPrice")
+        if underlying_price is None:
+            # Fallback if not available
+            underlying_price = stock.history(period="1d")['Close'].iloc[-1]
+
+        # Calculate the nearest strike price from the calls DataFrame
+        calls_df = options_chain.calls
+        if calls_df.empty:
+            nearest_strike = None
+        else:
+            # Compute the absolute difference between each strike and the underlying price
+            diff = (calls_df['strike'] - underlying_price).abs()
+            nearest_strike = calls_df.loc[diff.idxmin(), 'strike']
+
+        # Calculate implied volatility percentile (using median by default)
         call_ivs = options_chain.calls['impliedVolatility'].dropna().values
         put_ivs = options_chain.puts['impliedVolatility'].dropna().values
         iv_values = np.concatenate([call_ivs, put_ivs])
-        iv_percentile = float(np.percentile(iv_values, 50)) if len(iv_values) > 0 else None
+        iv_percentile = float(np.percentile(iv_values, percentile)) if len(iv_values) > 0 else None
+
+        # Calculate put/call ratio based on volume
         total_call_volume = options_chain.calls['volume'].sum()
         total_put_volume = options_chain.puts['volume'].sum()
         put_call_ratio = float(total_put_volume / total_call_volume) if total_call_volume > 0 else None
-        return {'iv_percentile': iv_percentile, 'put_call_ratio': put_call_ratio}
+
+        return {
+            'iv_percentile': iv_percentile,
+            'put_call_ratio': put_call_ratio,
+            'nearest_strike': nearest_strike,
+            'underlying_price': underlying_price
+        }
     except Exception as e:
         print(f"Error fetching options data for {symbol}: {e}")
         return None
@@ -256,8 +334,10 @@ def get_options_data(symbol):
 
 def get_filtered_stocks(top_n=10):
     """Filter stocks for directional options trades using refined technical analysis."""
-    active_stocks = get_top_active_stocks_alpha(top_n)
     filtered_stocks = []
+    options_stocks = ['TSLA','PLTR','NVDA','AAPL','AMZN','ASML','AVGO','COIN','GOOG','META','MSTR','NFLX','ORCL','QDTE','SPY','SMCI','UNH']
+    active_stocks = get_stock_data(options_stocks)
+
     print("\nAnalyzing stocks for directional options trades...")
     for stock in active_stocks:
         symbol = stock['symbol']
@@ -281,11 +361,13 @@ def get_filtered_stocks(top_n=10):
         if trade_decision:
             trade_info = {
                 'symbol': symbol,
-                'price': stock['price'],
-                'direction': trade_decision
+                'price': options_data['nearest_strike'],
+                'direction': trade_decision,
+                'nearest_strike': options_data['nearest_strike'],
+                'underlying_price': options_data['underlying_price']
             }
             filtered_stocks.append(trade_info)
-            print(f"✅ {symbol}: {trade_decision} opportunity at ${stock['price']:.2f}")
+            print(f"✅ {symbol}: {trade_decision} opportunity at ${stock['price']:.2f} nearest strike at ${options_data['nearest_strike']:.2f} and underlying price ${options_data['underlying_price']:.2f}")
         else:
             print(f"❌ {symbol}: No clear directional opportunity")
     print(f"\nFound {len(filtered_stocks)} potential trades:")
