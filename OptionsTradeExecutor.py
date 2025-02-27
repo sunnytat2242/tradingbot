@@ -1,3 +1,4 @@
+import asyncio
 import re
 import alpaca_trade_api as tradeapi
 from typing import Dict, List, Tuple
@@ -8,6 +9,7 @@ import math
 
 import schedule
 
+from alerts import send_telegram_alert
 from config import (
     ALPACA_API_KEY,
     ALPACA_API_SECRET
@@ -210,7 +212,9 @@ class OptionsTradeExecutor:
                 
                 # Sell position if profit is 20% or higher
                 if profit_loss_percent <= -STOP_LOSS or profit_loss_percent >= PROFIT_TARGET:
-                    print(f"Profit target reached for {symbol}. Selling position.")
+                    message = f"Profit target reached for {symbol} {profit_loss_percent}%. Selling position."
+                    print(message)
+                    asyncio.run(send_telegram_alert(message))
                     self.place_sell_order(symbol, qty)
                     
         except Exception as e:
@@ -399,24 +403,42 @@ class OptionsTradeExecutor:
         except Exception as e:
             print(f"Trading cycle error: {e}")
 
+def is_market_open():
+    """
+    Returns True if the current time in US/Eastern is between 9:30 AM and 4:00 PM on a weekday.
+    """
+    eastern = pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+    print(f"Current time: {now}")
+    # Check if today is a weekday (Monday=0 to Friday=4)
+    if now.weekday() >= 5:
+        return False
+    # Define market open and close times
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_time <= now <= close_time
+
 def run_options_trading():
     """Main trading loop with proper error handling and scheduling"""
-    executor = OptionsTradeExecutor()
-    executor.run_trading_cycle()
-    schedule.every(15).minutes.do(executor.run_trading_cycle)
-    schedule.every(1).minutes.do(executor.monitor_positions)
-    while True:
-        try:
-            schedule.run_pending()
-            #print("\nWaiting for next cycle...")
-            time.sleep(5)  # 5-secs delay between cycles
-            
-        except KeyboardInterrupt:
-            print("\nStopping options trading...")
-            break
-        except Exception as e:
-            print(f"Main loop error: {e}")
-            time.sleep(60)
+    if is_market_open():
+        executor = OptionsTradeExecutor()
+        executor.run_trading_cycle()
+        schedule.every(15).minutes.do(executor.run_trading_cycle)
+        schedule.every(1).minutes.do(executor.monitor_positions)
+        while True:
+            try:
+                schedule.run_pending()
+                #print("\nWaiting for next cycle...")
+                time.sleep(5)  # 5-secs delay between cycles
+
+            except KeyboardInterrupt:
+                print("\nStopping options trading...")
+                break
+            except Exception as e:
+                print(f"Main loop error: {e}")
+                time.sleep(60)
+    else:
+        print("Market is closed Options trading loop terminated")
 
 if __name__ == '__main__':
     run_options_trading()
