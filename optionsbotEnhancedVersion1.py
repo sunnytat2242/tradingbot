@@ -7,13 +7,14 @@ import time
 import pytz
 from datetime import datetime, timedelta
 import ta
-from ta.trend import MACD
+from ta.trend import MACD, SMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 import requests
 import yfinance as yf
 
 from alerts import send_telegram_alert
+from analysis import analyze_market_conditions_day_trading
 from config import ALPACA_API_KEY, ALPACA_API_SECRET, ALPHA_VANTAGE_API_KEY
 import time
 from ratelimit import sleep_and_retry, limits
@@ -35,8 +36,9 @@ MIN_STOCK_PRICE = 20.0
 MAX_STOCKS_TO_SCAN = 100
 API_TIMEOUT = 10
 MAX_RETRIES = 10
-options_stocks = ['TSLA', 'PLTR', 'NVDA', 'AAPL', 'AMZN', 'ASML', 'AVGO', 'COIN', 'GOOG', 'META', 'MSTR', 'NFLX',
-                      'ORCL', 'QDTE', 'SPY', 'SMCI', 'UNH','QQQ','LRCX','JPM','SNOW','FI','BA','MELI','INTC','AMD','MARA','MSFT']
+options_stocks = ['TSLA', 'PLTR']
+#, 'NVDA', 'AAPL', 'AMZN', 'ASML', 'AVGO', 'COIN', 'GOOG', 'META', 'MSTR', 'NFLX'
+ #                     ,'ORCL', 'QDTE', 'SPY', 'SMCI', 'UNH','QQQ','LRCX','JPM','SNOW','FI','BA','MELI','INTC','AMD','MARA','MSFT']
 
 def get_stock_data(symbols):
     stock_data = []
@@ -61,24 +63,20 @@ def get_stock_data(symbols):
 
     return stock_data
 
-def get_historical_data(symbol, timeframe='15Min', limit=60):
+
+def get_historical_data(symbol, timeframe='5Min', limit=50):
     """Get historical data for a symbol using Alpaca's API."""
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
             end = datetime.now(pytz.UTC)
-            start = end - timedelta(days=limit * 2)
-            start_str = start.strftime('%Y-%m-%d')
-            end_str = end.strftime('%Y-%m-%d')
+            start = end - timedelta(days=5)
+            while start.weekday() >= 5:  # Avoid weekends
+                start -= timedelta(days=1)
+            start_str, end_str = start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
             print(f"Fetching historical data for {symbol} from {start_str} to {end_str}...")
-            bars = api.get_bars(
-                symbol,
-                timeframe,
-                start=start_str,
-                end=end_str,
-                adjustment='raw',
-                feed='iex'
-            ).df
+            bars = api.get_bars(symbol, timeframe, start=start_str, end=end_str, adjustment='raw', feed='iex').df
+
             if len(bars) < limit:
                 print(f"Warning: Only got {len(bars)} bars for {symbol}")
                 return None
@@ -86,195 +84,44 @@ def get_historical_data(symbol, timeframe='15Min', limit=60):
         except Exception as e:
             print(e)
             retry_count += 1
-            if retry_count < MAX_RETRIES:
-                print(f"Retry {retry_count} for {symbol}")
-                time.sleep(2 ** retry_count)
-            else:
-                print(f"Failed to get data for {symbol} after {MAX_RETRIES} retries")
-                return None
+            time.sleep(2 ** retry_count)
+    print(f"Failed to get data for {symbol} after {MAX_RETRIES} retries")
+    return None
 
 
 def calculate_technical_indicators(df):
-    """Calculate technical indicators with improved parameters and additional confirmations."""
-    # Volume analysis
+    """Calculate technical indicators with faster responsiveness."""
+    if df is None or df.empty:
+        print("Error: DataFrame is empty.")
+        return None
+
+    df = df.copy()
     df['volume_sma'] = df['volume'].rolling(window=20).mean()
     df['volume_ratio'] = df['volume'] / df['volume_sma']
-
-    # Price action
     df['high_low_diff'] = df['high'] - df['low']
     df['close_open_diff'] = df['close'] - df['open']
 
-    # Trend Detection
-    df['sma20'] = df['close'].rolling(window=20).mean()
-    df['sma50'] = df['close'].rolling(window=50).mean()
-    df['sma200'] = df['close'].rolling(window=200).mean()
+    for window in [5, 10, 20, 50, 200]:
+        df[f'sma{window}'] = ta.trend.SMAIndicator(df['close'], window=window).sma_indicator()
 
-    # Enhanced MACD (longer periods for more reliable signals)
-    macd_indicator = MACD(df['close'],
-                          window_slow=26,  # Standard period
-                          window_fast=12,  # Standard period
-                          window_sign=9)  # Standard period
+    df['vwap'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume'], window=1).volume_weighted_average_price()
+
+    macd_indicator = ta.trend.MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
     df['macd'] = macd_indicator.macd()
     df['macd_signal'] = macd_indicator.macd_signal()
     df['macd_hist'] = macd_indicator.macd_diff()
 
-    # RSI with standard period
-    rsi_indicator = RSIIndicator(df['close'], window=14)  # Standard period
-    df['rsi'] = rsi_indicator.rsi()
+    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=7).rsi()  # Faster RSI
 
-    # Enhanced Bollinger Bands
-    bb = BollingerBands(df['close'], window=20, window_dev=2)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
-    df['bb_mid'] = bb.bollinger_mavg()
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
+    bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+    df['bb_upper'], df['bb_lower'], df['bb_mid'] = bb.bollinger_hband(), bb.bollinger_lband(), bb.bollinger_mavg()
 
-    # ATR for volatility measurement
-    df['tr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
+    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
 
-    # Momentum
-    df['roc'] = ta.momentum.roc(df['close'], window=10)
+    df['roc'] = ta.momentum.ROCIndicator(df['close'], window=10).roc()
 
+    df.dropna(subset=['sma5', 'sma10', 'macd', 'rsi', 'atr', 'vwap'], inplace=True)
     return df
-
-
-def analyze_market_conditions(df, options_data=None):
-    """Enhanced market analysis with multiple confirmation signals."""
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    analysis = {
-        'entry_signals': [],
-        'exit_signals': [],
-        'risk_level': 0,
-        'trend_strength': 0,
-        'volatility_state': ''
-    }
-
-    # Trend Analysis
-    trend_score = 0
-
-    # Multiple timeframe analysis
-    if latest['close'] > latest['sma20'] > latest['sma50']:
-        trend_score += 2
-        print("Strong uptrend confirmed by multiple SMAs (+2)")
-    elif latest['close'] < latest['sma20'] < latest['sma50']:
-        trend_score -= 2
-        print("Strong downtrend confirmed by multiple SMAs (-2)")
-
-    # Volume confirmation
-    if latest['volume_ratio'] > 1.5:
-        trend_score += 1
-        print("Strong volume confirmation (+1)")
-
-    # Price action confirmation
-    if latest['close_open_diff'] > 0 and latest['high_low_diff'] > df['high_low_diff'].mean():
-        trend_score += 1
-        print("Strong bullish price action (+1)")
-    elif latest['close_open_diff'] < 0 and latest['high_low_diff'] > df['high_low_diff'].mean():
-        trend_score -= 1
-        print("Strong bearish price action (-1)")
-
-    analysis['trend_strength'] = trend_score
-
-    # Momentum Analysis
-    momentum_score = 0
-
-    # MACD Analysis with confirmation
-    if latest['macd'] > latest['macd_signal'] and latest['macd_hist'] > prev['macd_hist']:
-        momentum_score += 2
-        print("Strong MACD bullish confirmation (+2)")
-    elif latest['macd'] < latest['macd_signal'] and latest['macd_hist'] < prev['macd_hist']:
-        momentum_score -= 2
-        print("Strong MACD bearish confirmation (-2)")
-
-    # RSI Analysis with dynamic thresholds
-    if 40 <= latest['rsi'] <= 60:  # Neutral zone
-        if latest['rsi'] > prev['rsi']:  # Rising RSI
-            momentum_score += 1
-            print("Rising RSI in neutral zone (+1)")
-        else:  # Falling RSI
-            momentum_score -= 1
-            print("Falling RSI in neutral zone (-1)")
-
-    # Rate of Change confirmation
-    if latest['roc'] > 0 and latest['roc'] > df['roc'].mean():
-        momentum_score += 1
-        print("Strong positive momentum (+1)")
-    elif latest['roc'] < 0 and latest['roc'] < df['roc'].mean():
-        momentum_score -= 1
-        print("Strong negative momentum (-1)")
-
-    # Volatility Analysis
-    volatility_score = 0
-    current_atr = latest['tr']
-    avg_atr = df['tr'].mean()
-
-    if current_atr < avg_atr * 0.8:
-        volatility_state = 'low'
-        volatility_score += 1
-        print("Low volatility environment (+1)")
-    elif current_atr > avg_atr * 1.2:
-        volatility_state = 'high'
-        volatility_score -= 1
-        print("High volatility environment (-1)")
-    else:
-        volatility_state = 'normal'
-
-    analysis['volatility_state'] = volatility_state
-
-    # Risk Assessment
-    risk_level = 0
-
-    # Market structure risk
-    if latest['close'] > latest['bb_upper']:
-        risk_level -= 1
-        print("Overbought conditions (-1)")
-    elif latest['close'] < latest['bb_lower']:
-        risk_level -= 1
-        print("Oversold conditions (-1)")
-
-    # Options market risk
-    if options_data:
-        if options_data.get('iv_percentile', 50) < 30:
-            risk_level += 1
-            print("Low IV environment (+1)")
-        elif options_data.get('iv_percentile', 50) > 70:
-            risk_level -= 1
-            print("High IV environment (-1)")
-
-        if options_data.get('put_call_ratio', 1) < 0.7:
-            risk_level += 1
-            print("Bullish options sentiment (+1)")
-        elif options_data.get('put_call_ratio', 1) > 1.3:
-            risk_level -= 1
-            print("Bearish options sentiment (-1)")
-
-    analysis['risk_level'] = risk_level
-
-    # Entry Signals (requiring multiple confirmations)
-    if (trend_score >= 2 and momentum_score >= 2 and risk_level >= 1 and
-            volatility_state != 'high'):
-        analysis['entry_signals'].append('strong_bullish')
-        print("Entry Signal: strong_bullish")
-    elif (trend_score <= -2 and momentum_score <= -2 and risk_level >= 1 and
-          volatility_state != 'high'):
-        analysis['entry_signals'].append('strong_bearish')
-        print("Entry Signal: strong_bearish")
-
-    # Exit Signals
-    if latest['rsi'] > 75 or latest['rsi'] < 25:
-        analysis['exit_signals'].append('rsi_extreme')
-        print("Exit Signal: RSI extreme")
-    if (latest['close'] < latest['sma20'] and prev['close'] > prev['sma20'] and
-            trend_score > 0):
-        analysis['exit_signals'].append('trend_reversal')
-        print("Exit Signal: Trend reversal")
-    if volatility_state == 'high' and abs(latest['roc']) > df['roc'].std() * 2:
-        analysis['exit_signals'].append('volatility_spike')
-        print("Exit Signal: Volatility spike")
-
-    return analysis
 
 
 def get_position_size(analysis, account_size, stock_price):
@@ -310,124 +157,93 @@ def get_position_size(analysis, account_size, stock_price):
 @sleep_and_retry
 @limits(calls=CALLS_PER_HOUR, period=PERIOD_IN_SECONDS)
 def get_options_data(symbol, percentile=50):
-    """Fetch options data using yfinance with rate limiting and improved error handling."""
+    CALLS_PER_MINUTE = 30
+    
     try:
-        # Add delay between requests
-        time.sleep(60 / CALLS_PER_MINUTE)  # Ensure even distribution of requests
-
+        time.sleep(60 / CALLS_PER_MINUTE)
         stock = yf.Ticker(symbol)
         if not stock.options:
             print(f"No available option expirations for {symbol}")
             return None
 
-        # Select the first (nearest) expiration
         expiry = stock.options[0]
+        options_chain = stock.option_chain(expiry)
 
-        # Add error handling for option chain retrieval
-        try:
-            options_chain = stock.option_chain(expiry)
-        except Exception as e:
-            print(f"Error fetching option chain for {symbol}: {e}")
-            return None
+        underlying_price = stock.info.get("regularMarketPrice")
+        if underlying_price is None:
+            quote = stock.history(period="1d")
+            if not quote.empty:
+                underlying_price = quote['Close'].iloc[-1]
+            else:
+                print(f"Unable to get price data for {symbol}")
+                return None
 
-        # Get the current underlying price with fallback options
-        try:
-            underlying_price = stock.info.get("regularMarketPrice")
-            if underlying_price is None:
-                # First fallback: try last quote
-                quote = stock.history(period="1d")
-                if not quote.empty:
-                    underlying_price = quote['Close'].iloc[-1]
-                else:
-                    print(f"Unable to get price data for {symbol}")
-                    return None
-        except Exception as e:
-            print(f"Error fetching price data for {symbol}: {e}")
-            return None
-
-        # Calculate the nearest strike price from the calls DataFrame
         calls_df = options_chain.calls
         if calls_df.empty:
             print(f"No calls data available for {symbol}")
             return None
 
-        # Compute the absolute difference between each strike and the underlying price
         diff = (calls_df['strike'] - underlying_price).abs()
         nearest_strike = calls_df.loc[diff.idxmin(), 'strike']
 
-        # Calculate implied volatility percentile with error handling
-        try:
-            call_ivs = options_chain.calls['impliedVolatility'].dropna().values
-            put_ivs = options_chain.puts['impliedVolatility'].dropna().values
-            iv_values = np.concatenate([call_ivs, put_ivs])
-            iv_percentile = float(np.percentile(iv_values, percentile)) if len(iv_values) > 0 else None
-        except Exception as e:
-            print(f"Error calculating IV percentile for {symbol}: {e}")
-            iv_percentile = None
+        call_ivs = options_chain.calls['impliedVolatility'].dropna().values
+        put_ivs = options_chain.puts['impliedVolatility'].dropna().values
+        current_ivs = np.concatenate([call_ivs, put_ivs])
+        iv_percentile = float(np.percentile(current_ivs, percentile) / np.max(current_ivs) * 100 if len(current_ivs) > 0 else 50.0)  # Normalize to 0-100
 
-        # Calculate put/call ratio with error handling
-        try:
-            total_call_volume = options_chain.calls['volume'].sum()
-            total_put_volume = options_chain.puts['volume'].sum()
-            put_call_ratio = float(total_put_volume / total_call_volume) if total_call_volume > 0 else None
-        except Exception as e:
-            print(f"Error calculating put/call ratio for {symbol}: {e}")
-            put_call_ratio = None
+        iv_hist = []
+        hist = stock.history(period="30d")
+        for exp in stock.options[:min(3, len(stock.options))]:
+            chain = stock.option_chain(exp)
+            iv_hist.extend(chain.calls['impliedVolatility'].dropna().values)
+            iv_hist.extend(chain.puts['impliedVolatility'].dropna().values)
+        iv_rank = float(np.percentile(current_ivs, percentile) / np.percentile(iv_hist, 100) * 100 if iv_hist else 50.0)
+        iv_rank = min(max(iv_rank, 0), 100)
 
+        total_call_volume = options_chain.calls['volume'].sum()
+        total_put_volume = options_chain.puts['volume'].sum()
+        put_call_ratio = float(total_put_volume / total_call_volume) if total_call_volume > 0 else 1.0
+
+        print(f"{symbol} Options: IV Percentile={iv_percentile:.1f}, IV Rank={iv_rank:.1f}, Put/Call={put_call_ratio:.2f}")
         return {
             'iv_percentile': iv_percentile,
+            'iv_rank': iv_rank,
             'put_call_ratio': put_call_ratio,
             'nearest_strike': nearest_strike,
             'underlying_price': underlying_price
         }
     except Exception as e:
         print(f"Error fetching options data for {symbol}: {e}")
-        # Add exponential backoff retry
-        retry_delay = 60  # Start with 1 minute delay
         max_retries = 3
+        retry_delay = 60
         for retry in range(max_retries):
-            print(f"Retrying in {retry_delay} seconds... (Attempt {retry + 1}/{max_retries})")
             time.sleep(retry_delay)
             try:
                 return get_options_data(symbol, percentile)
             except Exception as retry_e:
                 print(f"Retry {retry + 1} failed: {retry_e}")
-                retry_delay *= 2  # Exponential backoff
+                retry_delay *= 2
         return None
 
 
 def get_filtered_stocks(top_n=10):
-    """Filter stocks for directional options trades with improved rate limiting."""
     filtered_stocks = []
-
-    # Add delay between stock analysis
-    delay_between_stocks = 5  # seconds
+    delay_between_stocks = 1
 
     print("\nAnalyzing stocks for directional options trades...")
 
     for stock in options_stocks:
         try:
             print(f"\nAnalyzing {stock}...")
-
-            # Get historical data with retry mechanism
-            bars = None
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    bars = get_historical_data(stock)
-                    if bars is not None:
-                        break
-                except Exception as e:
-                    print(f"Attempt {attempt + 1}/{retries} failed: {e}")
-                    time.sleep(delay_between_stocks * (attempt + 1))
-
+            bars = get_historical_data(stock)
             if bars is None:
-                print(f"Failed to get historical data for {stock} after {retries} attempts")
+                print(f"Failed to get historical data for {stock}")
                 continue
 
             df = calculate_technical_indicators(bars)
+            if df is None:
+                continue
 
-            # Add delay before fetching options data
             time.sleep(delay_between_stocks)
 
             options_data = get_options_data(stock)
@@ -435,44 +251,47 @@ def get_filtered_stocks(top_n=10):
                 print(f"❌ {stock}: No options data available")
                 continue
 
-            analysis = analyze_market_conditions(df, options_data)
+            analysis = analyze_market_conditions_day_trading(df, options_data)
+            print(f"Risk level for {stock}: {analysis['risk_level']}")
+            print(f"Entry signals for {stock}: {analysis['entry_signals']}")
+            print(f"Exit signals for {stock}: {analysis['exit_signals']}")
 
-            # Determine trade direction with more stringent criteria
             trade_decision = None
-            if 'strong_bullish' in analysis['entry_signals'] and analysis['risk_level'] >= 1:
+            if 'strong_bullish' in analysis['entry_signals'] and analysis['risk_level'] >= 1 and not analysis['exit_signals']:
                 trade_decision = 'CALL'
-            elif 'strong_bearish' in analysis['entry_signals'] and analysis['risk_level'] >= 1:
+            elif 'strong_bearish' in analysis['entry_signals'] and analysis['risk_level'] >= 1 and not analysis['exit_signals']:
                 trade_decision = 'PUT'
 
             if trade_decision:
                 trade_info = {
                     'symbol': stock,
-                    'price': options_data['nearest_strike'],
+                    'price': options_data['underlying_price'],
                     'direction': trade_decision,
                     'nearest_strike': options_data['nearest_strike'],
-                    'underlying_price': options_data['underlying_price']
+                    'underlying_price': options_data['underlying_price'],
+                    'trend_strength': analysis['trend_strength'],
+                    'momentum_score': sum([1 if 'bullish' in s else -1 if 'bearish' in s else 0 for s in analysis['entry_signals']])
                 }
                 filtered_stocks.append(trade_info)
-                print(
-                    f"✅ {stock}: {trade_decision} opportunity at ${options_data['underlying_price']:.2f} nearest strike at ${options_data['nearest_strike']:.2f}")
+                message = f"✅ {stock}: {trade_decision} opportunity at ${options_data['underlying_price']:.2f}, nearest strike ${options_data['nearest_strike']:.2f}"
+                asyncio.run(send_telegram_alert(message))
             else:
                 print(f"❌ {stock}: No clear directional opportunity")
 
-            # Add delay between stocks
             time.sleep(delay_between_stocks)
 
         except Exception as e:
             print(f"Error analyzing {stock}: {e}")
             continue
 
-    print(f"\nFound {len(filtered_stocks)} potential trades:")
+    filtered_stocks = sorted(filtered_stocks, key=lambda x: abs(x['trend_strength']) + abs(x['momentum_score']), reverse=True)[:top_n]
+
+    print(f"\nFound {len(filtered_stocks)} potential trades (top {top_n}):")
     for trade in filtered_stocks:
-        message = f"{trade['symbol']}: {trade['direction']} at ${trade['price']:.2f}"
+        message = f"{trade['symbol']}: {trade['direction']} at ${trade['underlying_price']:.2f}, strike ${trade['nearest_strike']:.2f}"
         print(message)
-        asyncio.run(send_telegram_alert(message))
 
     return filtered_stocks
-
 
 def options_trading_bot():
     """Main options trading loop with refined logic."""

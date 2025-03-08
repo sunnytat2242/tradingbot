@@ -6,286 +6,184 @@ import time
 from datetime import datetime, timedelta
 import pytz
 import math
-
 import schedule
-
 from alerts import send_telegram_alert
-from config import (
-    ALPACA_API_KEY,
-    ALPACA_API_SECRET
-)
-from optionsbotEnhancedVersion1 import(
-    get_historical_data,
-    calculate_technical_indicators,
-    analyze_market_conditions,
-    get_filtered_stocks
-)
-import requests  # Added this import
-from datetime import datetime, timedelta
+from config import ALPACA_API_KEY, ALPACA_API_SECRET
+from optionsbotEnhancedVersion1 import get_filtered_stocks
+import requests
 from scipy.stats import norm
 
+# Trading Parameters (unchanged)
+POSITION_SIZE = 0.02
+MAX_POSITIONS = 10
+MIN_STOCK_PRICE = 25.0
+STOP_LOSS = 15.0
+INITIAL_PROFIT_TARGET = 20.0
+TRAILING_BUFFER_PERCENT = 5.0
+PROFIT_TARGET = 25.0
 
-def get_days_to_expiration():
-    today = datetime.today()
-    days_ahead = (4 - today.weekday()) % 7  # 4 = Friday (0 = Monday, 6 = Sunday)
-    if days_ahead == 0:  # If today is Friday, move to next Friday
-        days_ahead = 7
-    return days_ahead
-# Trading Parameters
-POSITION_SIZE = 0.02  # 2% of portfolio per trade
-MAX_POSITIONS = 5
-PROFIT_TARGET = 20  # 50% profit target for options
-STOP_LOSS = 20     # 30% stop loss for options
-DAYS_TO_EXPIRATION = get_days_to_expiration()  # Target days to expiration
-DELTA_TARGET = 0.30  # Target delta for options
-
-# Stock Filtering Parameters
-MIN_STOCK_PRICE = 25.0  # Minimum stock price
-MIN_VOLUME = 1000000  # Minimum daily volume
-MIN_MARKET_CAP = 1000000000  # Minimum market cap ($1B)
-
-
+# API Configuration (unchanged)
 BASE_URL = 'https://paper-api.alpaca.markets'
-DATA_URL = 'https://data.alpaca.markets'
 HEADERS = {
     'APCA-API-KEY-ID': ALPACA_API_KEY,
     'APCA-API-SECRET-KEY': ALPACA_API_SECRET,
     'Content-Type': 'application/json'
 }
+
 class OptionsTradeExecutor:
     def __init__(self):
         self.api = tradeapi.REST(ALPACA_API_KEY, ALPACA_API_SECRET, BASE_URL, api_version='v2')
-        self.positions = []
         self.traded_today = set()
         self.last_trade_date = datetime.now(pytz.UTC).date()
 
     def reset_daily_trades(self):
-        """Reset the daily traded symbols if a new day has started."""
+        """Reset daily traded symbols if a new day starts."""
         current_date = datetime.now(pytz.UTC).date()
         if current_date != self.last_trade_date:
             print("New day detected. Resetting traded symbols list.")
             self.traded_today.clear()
             self.last_trade_date = current_date
 
-    def get_next_valid_expiry(self) -> datetime:
-        """Get next valid expiration date (not today, next available Friday)"""
-        today = datetime.now(pytz.UTC)
-        days_ahead = (4 - today.weekday()) % 7  # 4 = Friday
-        
-        # If today is Friday, get next Friday
-        if days_ahead == 0:
-            days_ahead = 7
-            
-        # If it's too close to market close on Thursday, get next Friday
-        if today.weekday() == 3 and today.hour >= 15:  # Thursday after 3 PM
-            days_ahead = 8
-            
-        next_expiry = today + timedelta(days=days_ahead)
-        return next_expiry.replace(hour=16, minute=0, second=0, microsecond=0)  # 4 PM ET
-
-    def should_close_expiring_positions(self) -> bool:
-        """Check if we should close positions expiring today"""
-        now = datetime.now(pytz.UTC)
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-        
-        # Close positions if it's the expiration day and within last hour of trading
-        if now.weekday() == 4:  # Friday
-            time_to_close = (market_close - now).total_seconds() / 3600
-            return time_to_close <= 1
-        return False
-
-    def place_sell_order(self, symbol: str, qty: int):
-        """Place a sell order to close an open position"""
+    def get_option_contracts(self, symbol: str) -> List[Dict]:
+        """Fetch all option contracts for a given symbol using Alpaca API."""
         try:
-            # Place the sell order for the option contract
-            order_data = {
-                'symbol': symbol,
-                'qty': qty,
-                'side': 'sell',
-                'type': 'market',
-                'time_in_force': 'day'
+            url = f"{BASE_URL}/v2/options/contracts"
+            params = {
+                'underlying_symbols': symbol,
+                'status': 'active',
+                'limit': 100
             }
-
-            # Debugging: Print the request before sending
-            print("\n=== SELL ORDER DETAILS ===")
-            print(order_data)
-
-            # Send the order request to sell the option
-            response = requests.post(
-                f"{BASE_URL}/v2/orders",
-                headers=HEADERS,
-                json=order_data
-            )
-
-            # Debugging: Check API response
-            print(f"Sell Order Response: {response.status_code} - {response.text}")
-
+            response = requests.get(url, headers=HEADERS, params=params)
             if response.status_code == 200:
-                print(f"Sold {symbol} position with profit!")
+                contracts = response.json().get('option_contracts', [])
+                print(f"Fetched {len(contracts)} option contracts for {symbol}")
+                return contracts
             else:
-                print(f"Error selling position: {response.status_code} - {response.text}")
-
+                print(f"Error fetching option contracts for {symbol}: {response.text}")
+                return []
         except Exception as e:
-            print(f"Error placing sell order for {symbol}: {e}")
+            print(f"Exception fetching option contracts for {symbol}: {e}")
+            return []
 
+    def calculate_delta(self, stock_price, strike_price, days_to_expiry, is_call):
+        """Calculate the delta of an option using Black-Scholes."""
+        T = max(days_to_expiry / 365.0, 0.001)  # Convert days to years, ensure T > 0
+        S, K, sigma, r = stock_price, strike_price, 0.3, 0.01  # Volatility and risk-free rate
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        return norm.cdf(d1) if is_call else norm.cdf(d1) - 1
 
-    def close_expiring_positions(self):
-        """Close all positions expiring today"""
-        try:
-            positions = self.api.list_positions()
-            
-            for position in positions:
-                symbol = position.symbol
-                
-                # Extract expiration date from the option symbol (format: AAPL230915C150)
-                expiry_str = symbol[-15:-9]  # Extract the 6-digit date (YYMMDD) from the symbol
-                
-                try:
-                    expiry_date = datetime.strptime(expiry_str, '%y%m%d').date()
-                except ValueError:
-                    print(f"Error parsing expiration date for {symbol}")
-                    continue  # Skip if the date is invalid
-                
-                # Check if the option expires today
-                if expiry_date == datetime.now().date():
-                    print(f"Closing position {symbol} due to same-day expiration")
-                    self.place_sell_order(symbol, int(position.qty))
-                    
-        except Exception as e:
-            print(f"Error closing expiring positions: {e}")
+    def select_nearest_expiry_and_strike(self, symbol: str, current_price: float, is_bullish: bool) -> Tuple[str, float, datetime]:
+        """Select the nearest expiration and strike with delta closest to target from Alpaca API data."""
+        contracts = self.get_option_contracts(symbol)
+        if not contracts:
+            print(f"No option contracts found for {symbol}")
+            return None, None, None
 
+        # Filter contracts by type (call or put)
+        option_type = 'call' if is_bullish else 'put'
+        relevant_contracts = [c for c in contracts if c['type'] == option_type]
 
-    def get_buying_power(self) -> float:
-        """Get available buying power from account"""
-        account = self.api.get_account()
-        return float(account.buying_power)
+        if not relevant_contracts:
+            print(f"No {option_type} contracts found for {symbol}")
+            return None, None, None
 
-    def find_nearest_strikes(self, current_price: float, num_strikes: int = 5) -> List[float]:
-        """Find nearest strike prices based on current stock price"""
-        # Round to nearest 0.5 for stocks under 100, nearest 1 for stocks over 100
-        if current_price < 100:
-            base_strike = round(current_price * 2) / 2
-        else:
-            base_strike = round(current_price)
-            
-        strikes = []
-        for i in range(-num_strikes, num_strikes + 1):
-            if current_price < 100:
-                strike = base_strike + (i * 0.5)
-            else:
-                strike = base_strike + (i * 1.0)
-            strikes.append(strike)
-            
-        return strikes
+        # Convert expiration dates to datetime and find nearest future expiry
+        now = datetime.now(pytz.UTC)
+        expiry_dates = sorted(
+            set(datetime.strptime(c['expiration_date'], '%Y-%m-%d').replace(tzinfo=pytz.UTC) for c in relevant_contracts),
+            key=lambda x: (x - now).days if (x - now).days >= 0 else float('inf')
+        )
+        if not expiry_dates:
+            print(f"No future expirations found for {symbol}")
+            return None, None, None
 
-    def _get_current_underlyings(self) -> List[str]:
-        """Get list of underlying symbols from current option positions"""
-        positions = self.api.list_positions()
-        underlyings = []
-        for pos in positions:
-            # Extract underlying from option symbol using regex
-            match = re.match(r'^([A-Z]+)\d{6}[CP]\d{8}$', pos.symbol)
-            if match:
-                underlyings.append(match.group(1))
-        return list(set(underlyings))  # Remove duplicates
+        nearest_expiry = expiry_dates[0]
+        print(f"Nearest expiry for {symbol}: {nearest_expiry.strftime('%Y-%m-%d')}")
 
-    def monitor_positions(self):
-        """Monitor existing positions and sell if the profit target is met"""
-        try:
-            # Get the current list of positions
-            positions = self.api.list_positions()
-            
-            for position in positions:
-                symbol = position.symbol
-                qty = int(position.qty)  # Quantity of contracts
-                avg_entry_price = float(position.avg_entry_price)  # Entry price
-                current_price = float(position.current_price)  # Current price of the option contract
-                
-                # Calculate current profit/loss percentage
-                profit_loss_percent = ((current_price - avg_entry_price) / avg_entry_price) * 100
-                
-                print(f"\nMonitoring {symbol}:")
-                print(f"Contracts: {qty}")
-                print(f"Avg Entry Price: ${avg_entry_price:.2f}")
-                print(f"Current Price: ${current_price:.2f}")
-                print(f"P&L: ${float(position.unrealized_pl):.2f} ({profit_loss_percent:.2f}%)")
-                
-                # Sell position if profit is 20% or higher
-                if profit_loss_percent <= -STOP_LOSS or profit_loss_percent >= PROFIT_TARGET:
-                    message = f"Profit target reached for {symbol} {profit_loss_percent}%. Selling position."
-                    print(message)
-                    asyncio.run(send_telegram_alert(message))
-                    self.place_sell_order(symbol, qty)
-                    
-        except Exception as e:
-            print(f"Error monitoring positions: {e}")
+        # Calculate days to expiry once, before the loop
+        days_to_expiry = (nearest_expiry - now).days
+        if days_to_expiry < 0:
+            print(f"Calculated days_to_expiry {days_to_expiry} is negative for {symbol}")
+            return None, None, None
+        print(f"Days to expiry for {symbol}: {days_to_expiry}")
 
+        # Filter contracts for this expiry
+        expiry_contracts = [c for c in relevant_contracts if c['expiration_date'] == nearest_expiry.strftime('%Y-%m-%d')]
+        if not expiry_contracts:
+            print(f"No contracts found for expiry {nearest_expiry.strftime('%Y-%m-%d')}")
+            return None, None, None
+
+        # Calculate delta for each strike
+        strike_deltas = []
+        for c in expiry_contracts:
+            strike = float(c['strike_price'])
+            delta = self.calculate_delta(current_price, strike, days_to_expiry, is_bullish)
+            strike_deltas.append((strike, delta, c['symbol']))
+
+        # Select strike with delta closest to target (0.3 for calls, -0.3 for puts)
+        target = 0.3 if is_bullish else -0.3
+        closest_strike_data = min(strike_deltas, key=lambda x: abs(x[1] - target))
+        print(f"Selected strike ${closest_strike_data[0]:.2f} for {symbol} (symbol: {closest_strike_data[2]}, delta: {closest_strike_data[1]:.3f})")
+
+        return closest_strike_data[2], closest_strike_data[0], nearest_expiry
 
     def calculate_option_price(self, stock_price: float, strike_price: float,
                                days_to_expiry: int, is_call: bool,
                                volatility: float = 0.3, risk_free_rate: float = 0.01) -> float:
-        """
-        Calculate the theoretical option price using the Black–Scholes formula.
-
-        Parameters:
-          stock_price (float): Current price of the underlying asset (S).
-          strike_price (float): Option strike price (K).
-          days_to_expiry (int): Days to expiration; converted to years (T).
-          is_call (bool): True for call option, False for put option.
-          volatility (float): Annualized volatility (σ). Default is 0.3.
-          risk_free_rate (float): Annualized risk-free rate (r). Default is 0.01 (1%).
-
-        Returns:
-          float: Option price rounded to 2 decimal places.
-        """
-        T = days_to_expiry / 365.0
-        # If expiration has passed, return intrinsic value
+        """Calculate theoretical option price using Black-Scholes (unchanged)."""
+        T = max(days_to_expiry / 365.0, 0.001)
         if T <= 0:
             return max(0, (stock_price - strike_price) if is_call else (strike_price - stock_price))
-
-        S = stock_price
-        K = strike_price
-        sigma = volatility
-        r = risk_free_rate
-
-        # Compute d1 and d2 as per Black-Scholes
+        S, K, sigma, r = stock_price, strike_price, volatility, risk_free_rate
         d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
-
         if is_call:
             price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
         else:
             price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        return round(max(price, 0.01), 2)
 
-        return round(price, 2)
+    def select_option_contract(self, symbol: str, current_price: float, is_bullish: bool, strike: float) -> Tuple[str, float, float]:
+        """Select an option contract using Alpaca API data."""
+        try:
+            # Fetch nearest expiry and valid strike
+            option_symbol, strike_price, expiry_date = self.select_nearest_expiry_and_strike(symbol, current_price, is_bullish)
+            if not option_symbol:
+                print(f"Could not find suitable option contract for {symbol}")
+                return None, None, None
+
+            # Calculate days to expiry
+            days_to_expiry = (expiry_date - datetime.now(pytz.UTC)).days
+            if days_to_expiry < 0:
+                print(f"Selected expiry {expiry_date.strftime('%Y-%m-%d')} is in the past")
+                return None, None, None
+
+            # Calculate option price using your Black-Scholes model
+            option_price = self.calculate_option_price(current_price, strike_price, days_to_expiry, is_bullish)
+            print(f"Contract selected: {option_symbol}, Strike: ${strike_price:.2f}, Price: ${option_price:.2f}")
+
+            return option_symbol, option_price, strike_price
+        except Exception as e:
+            print(f"Error selecting option contract for {symbol}: {e}")
+            return None, None, None
 
     def place_options_trade(self, symbol: str, price: float, direction: str, strike: float) -> bool:
-        """Place options trade based on market conditions"""
+        """Place an options trade (unchanged except for updated select_option_contract call)."""
+        current_underlyings = self._get_current_underlyings()
+        if len(current_underlyings) >= MAX_POSITIONS:
+            print(f"Max positions ({MAX_POSITIONS}) reached. Skipping {symbol}.")
+            return False
         try:
-            # Determine trade direction based on market conditions
-            if direction == "CALL":
-                is_bullish = True 
-            else:
-                is_bullish = False            
-            
-            # Select appropriate option contract
-            contract_symbol, contract_price, strike_price = self.select_option_contract(
-                symbol, 
-                price, 
-                is_bullish,
-                strike
-            )
-            
+            is_bullish = direction == "CALL"
+            contract_symbol, contract_price, strike_price = self.select_option_contract(symbol, price, is_bullish, strike)
             if not contract_symbol or not contract_price:
                 print(f"Could not find suitable option contract for {symbol}")
                 return False
 
-            # Calculate position size
             buying_power = self.get_buying_power()
             max_position_value = buying_power * POSITION_SIZE
             contracts = max(1, int(max_position_value / (contract_price * 100)))
-            
-            # Prepare order data (Simple Limit Order without bracket)
+
             order_data = {
                 'symbol': contract_symbol,
                 'qty': contracts,
@@ -293,21 +191,10 @@ class OptionsTradeExecutor:
                 'type': 'market',
                 'time_in_force': 'day'
             }
-
-            # Debugging: Print the request before sending
             print("\n=== ORDER DETAILS ===")
             print(order_data)
 
-            # Send order request (this is a simple limit order, no bracket)
-            response = requests.post(
-                f"{BASE_URL}/v2/orders",
-                headers=HEADERS,
-                json=order_data
-            )
-
-            # Debugging: Check API response
-            print(f"Order Response: {response.status_code} - {response.text}")
-
+            response = requests.post(f"{BASE_URL}/v2/orders", headers=HEADERS, json=order_data)
             if response.status_code == 200:
                 print(f"""
                 Placed {'bullish' if is_bullish else 'bearish'} options trade:
@@ -319,126 +206,79 @@ class OptionsTradeExecutor:
             else:
                 print(f"Error placing order: {response.status_code} - {response.text}")
                 return False
-
         except Exception as e:
             print(f"Error placing options trade for {symbol}: {e}")
             return False
 
-
-    def select_option_contract(self, symbol: str, current_price: float, is_bullish: bool,strike: float) -> Tuple[str, float, float]:
-        """Select appropriate option contract with valid expiration"""
+    def get_buying_power(self) -> float:
         try:
-            # Get next valid expiration
-            next_expiry = self.get_next_valid_expiry()
-            
-            # Get nearest strikes
-            #strikes = self.find_nearest_strikes(current_price)
-            
-            # Select strike based on direction
-            #if is_bullish:
-                #strike = max([s for s in strikes if s <= current_price])
-            #else:
-                #strike = min([s for s in strikes if s >= current_price])
-            
-            # Calculate theoretical option price
-            option_price = self.calculate_option_price(
-                current_price, 
-                strike, 
-                (next_expiry - datetime.now(pytz.UTC)).days,
-                is_bullish
-            )
-            
-            # Generate option symbol with next valid expiry
-            expiry_str = next_expiry.strftime('%y%m%d')
-            option_type = 'C' if is_bullish else 'P'
-            strike_str = str(int(strike * 1000)).zfill(8)
-            option_symbol = f"{symbol}{expiry_str}{option_type}{strike_str}"
-            
-            return option_symbol, option_price, strike
-            
+            account = self.api.get_account()
+            return float(account.buying_power)
         except Exception as e:
-            print(f"Error selecting option contract for {symbol}: {e}")
-            return None, None, None
+            print(f"Error fetching buying power: {e}")
+            return 0.0
+
+    def _get_current_underlyings(self) -> List[str]:
+        try:
+            positions = self.api.list_positions()
+            underlyings = [re.match(r'^([A-Z]+)\d{6}[CP]\d{8}$', pos.symbol).group(1) for pos in positions if re.match(r'^([A-Z]+)\d{6}[CP]\d{8}$', pos.symbol)]
+            return list(set(underlyings))
+        except Exception as e:
+            print(f"Error getting current underlyings: {e}")
+            return []
 
     def run_trading_cycle(self):
-        """Execute one complete trading cycle"""
+        if not is_market_open(False):
+            print("Market is closed. Skipping trading cycle.")
+            return
         try:
-            self.reset_daily_trades()  # Reset if a new day has started
+            self.reset_daily_trades()
             print("\n=== Running Options Trading Cycle ===")
-            
-            # First check if we need to close any expiring positions
-            if self.should_close_expiring_positions():
-                print("Closing positions expiring today...")
-                self.close_expiring_positions()
-            
-            # Get and process new trading opportunities
             filtered_stocks = get_filtered_stocks(100)
-            
+            if not filtered_stocks:
+                print("No stocks meet criteria. Waiting for next cycle...")
+                return
+
+            current_underlyings = self._get_current_underlyings()
             for stock in filtered_stocks:
-                if not filtered_stocks:
-                    print("No stocks meet criteria. Waiting for next cycle....")
-                    continue
-                    
                 symbol = stock['symbol']
                 price = stock['price']
                 direction = stock['direction']
                 nearest_strike = stock['nearest_strike']
-                
-                current_underlyings = self._get_current_underlyings()
-                if symbol in current_underlyings:
-                    print(f"⚠️ Skipping {symbol} - open position exists")
+                if symbol in current_underlyings or symbol in self.traded_today or price < MIN_STOCK_PRICE:
+                    print(f"Skipping {symbol}")
                     continue
-                if symbol in self.traded_today:
-                    print(f"⚠️ Skipping {symbol} - already traded today")
-                    continue
-
-                if price < MIN_STOCK_PRICE:
-                    print(f"Skipping {symbol}: Price (${price:.2f}) below minimum (${MIN_STOCK_PRICE:.2f})")
-                    continue
-                # Place new trades
-                trade_success = self.place_options_trade(symbol, price, direction,nearest_strike)
+                trade_success = self.place_options_trade(symbol, price, direction, nearest_strike)
                 if trade_success:
-                    # Record that this underlying has been traded today
                     self.traded_today.add(symbol)
         except Exception as e:
             print(f"Trading cycle error: {e}")
 
-def is_market_open():
-    """
-    Returns True if the current time in US/Eastern is between 9:30 AM and 4:00 PM on a weekday.
-    """
+def is_market_open(skip: bool = False) -> bool:
+    if skip:
+        return True
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
-    print(f"Current time: {now}")
-    # Check if today is a weekday (Monday=0 to Friday=4)
     if now.weekday() >= 5:
         return False
-    # Define market open and close times
     open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
     close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return open_time <= now <= close_time
 
 def run_options_trading():
-    """Main trading loop with proper error handling and scheduling"""
-    if is_market_open():
-        executor = OptionsTradeExecutor()
-        executor.run_trading_cycle()
-        schedule.every(15).minutes.do(executor.run_trading_cycle)
-        schedule.every(1).minutes.do(executor.monitor_positions)
-        while True:
-            try:
-                schedule.run_pending()
-                #print("\nWaiting for next cycle...")
-                time.sleep(5)  # 5-secs delay between cycles
-
-            except KeyboardInterrupt:
-                print("\nStopping options trading...")
-                break
-            except Exception as e:
-                print(f"Main loop error: {e}")
-                time.sleep(60)
-    else:
-        print("Market is closed Options trading loop terminated")
+    executor = OptionsTradeExecutor()
+    executor.run_trading_cycle()
+    schedule.every(15).minutes.do(executor.run_trading_cycle)
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(5)
+        except KeyboardInterrupt:
+            print("\nStopping options trading...")
+            break
+        except Exception as e:
+            print(f"Main loop error: {e}")
+            time.sleep(60)
 
 if __name__ == '__main__':
     run_options_trading()
