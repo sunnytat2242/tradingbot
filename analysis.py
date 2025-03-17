@@ -31,10 +31,10 @@ IV_HIGH_THRESHOLD = 70       # High implied volatility threshold
 PUT_CALL_RATIO_BULLISH = 0.7 # below this is bullish sentiment
 PUT_CALL_RATIO_BEARISH = 1.3 # above this is bearish sentiment
 
-# Entry Signal Requirements
-ENTRY_TREND_THRESHOLD = 2
-ENTRY_MOMENTUM_THRESHOLD = 2
-ENTRY_RISK_THRESHOLD = 1
+# Entry Signal Requirements - UPDATED for more permissive entry
+ENTRY_TREND_THRESHOLD = 1    # Reduced from 3 to 1
+ENTRY_MOMENTUM_THRESHOLD = 1 # Reduced from 3 to 1
+ENTRY_RISK_THRESHOLD = 0     # Reduced from 2 to 0
 
 # Volatility Spike Exit
 ROC_VOLATILITY_MULTIPLIER = 2  # multiplier for ROC std dev in volatility spike exit
@@ -42,13 +42,13 @@ ROC_VOLATILITY_MULTIPLIER = 2  # multiplier for ROC std dev in volatility spike 
 def analyze_market_conditions_day_trading(df, options_data=None):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
-
     analysis = {
         'entry_signals': [],
         'exit_signals': [],
         'risk_level': 0,
         'trend_strength': 0,
-        'volatility_state': ''
+        'volatility_state': '',
+        'momentum_score': 0  # Ensure this is initialized
     }
 
     # Trend Analysis
@@ -90,6 +90,18 @@ def analyze_market_conditions_day_trading(df, options_data=None):
         print("Strong negative momentum (-1)")
     print(f"Momentum Score: {momentum_score}")
 
+    # Additional Momentum Confirmation
+    mom_confirm = 0
+    if latest['macd'] > latest['macd_signal'] and latest['rsi'] > 55:
+        mom_confirm += 1
+        print("MACD and RSI both confirm bullish momentum (+1)")
+    elif latest['macd'] < latest['macd_signal'] and latest['rsi'] < 45:
+        mom_confirm -= 1
+        print("MACD and RSI both confirm bearish momentum (-1)")
+    momentum_score += mom_confirm
+    analysis['momentum_score'] = momentum_score  # Set here
+
+
     # Volatility Analysis
     current_atr = latest['atr']
     avg_atr = df['atr'].mean()
@@ -105,10 +117,10 @@ def analyze_market_conditions_day_trading(df, options_data=None):
 
     # Risk Assessment
     risk_level = 0
-    if latest['rsi'] > 80:
+    if latest['rsi'] > 80:  # Stricter overbought threshold
         risk_level -= 1
         print("Extreme overbought conditions (-1)")
-    elif latest['rsi'] < 20:
+    elif latest['rsi'] < 20:  # Stricter oversold threshold
         risk_level -= 1
         print("Extreme oversold conditions (-1)")
     if volatility_state == 'low':
@@ -117,10 +129,10 @@ def analyze_market_conditions_day_trading(df, options_data=None):
         risk_level -= 1
     if options_data:
         iv_rank = options_data.get('iv_rank', 50)
-        if 15 <= iv_rank <= 80:
+        if 20 <= iv_rank <= 75:
             risk_level += 1
             print("Optimal IV range (+1)")
-        elif iv_rank > 80:  # Tightened from 90
+        elif iv_rank > 75:
             risk_level -= 1
             print("High IV environment (-1)")
         if options_data.get('put_call_ratio', 1) < 0.7:
@@ -132,37 +144,72 @@ def analyze_market_conditions_day_trading(df, options_data=None):
     if latest['volume_ratio'] > 1.5:
         risk_level += 1
         print("Volume confirmation boosts risk (+1)")
-    if abs(trend_score) + abs(momentum_score) >= 5:
+    if abs(trend_score) + abs(momentum_score) >= 6:
         risk_level += 1
         print("Strong trend-momentum synergy (+1)")
     analysis['risk_level'] = risk_level
 
-    # Entry Signals
-    if trend_score >= 2 and momentum_score >= 1 and volatility_state != 'high':
+    # Entry Signals - UPDATED for more permissive entry
+    if trend_score >= 1 and momentum_score >= 1:
         analysis['entry_signals'].append('strong_bullish')
         print("Entry Signal: strong_bullish")
-    elif trend_score <= -2 and momentum_score <= -1 and volatility_state != 'high':
+    elif trend_score <= -1 and momentum_score <= -1:
         analysis['entry_signals'].append('strong_bearish')
         print("Entry Signal: strong_bearish")
-    elif volatility_state == 'high' and momentum_score >= 3:
-        analysis['entry_signals'].append('strong_bullish')
-        print("Entry Signal: strong_bullish (high volatility)")
-    elif volatility_state == 'high' and momentum_score <= -3:
-        analysis['entry_signals'].append('strong_bearish')
-        print("Entry Signal: strong_bearish (high volatility)")
+    elif trend_score >= 1 and momentum_score >= 1 and volatility_state != 'high':
+        analysis['entry_signals'].append('bullish')
+        print("Entry Signal: bullish")
+    elif trend_score <= -1 and momentum_score <= -1 and volatility_state != 'high':
+        analysis['entry_signals'].append('bearish')
+        print("Entry Signal: bearish")
+
+    # Indicator Confluence Signals (More Permissive Criteria)
+    if latest['macd'] > latest['macd_signal'] and latest['rsi'] > 50 and trend_score > 0:
+        analysis['entry_signals'].append('indicator_confluence_bullish')
+        print("Entry Signal: indicator_confluence_bullish")
+    elif latest['macd'] < latest['macd_signal'] and latest['rsi'] < 50 and trend_score < 0:
+        analysis['entry_signals'].append('indicator_confluence_bearish')
+        print("Entry Signal: indicator_confluence_bearish")
 
     # Exit Signals
-    if latest['rsi'] > 80 or latest['rsi'] < 20:
+    if latest['rsi'] > RSI_EXIT_HIGH or latest['rsi'] < RSI_EXIT_LOW:  # Using defined thresholds (80, 20)
         analysis['exit_signals'].append('rsi_extreme')
         print("Exit Signal: RSI extreme")
-    if latest['close'] < latest['sma5'] and prev['close'] > prev['sma5'] and trend_score > 0:
+    if latest['close'] < latest['sma10'] and prev['close'] > prev['sma10'] and trend_score > 0:
         analysis['exit_signals'].append('trend_reversal')
         print("Exit Signal: Trend reversal (bullish)")
-    elif latest['close'] > latest['sma5'] and prev['close'] < prev['sma5'] and trend_score < 0:
+    elif latest['close'] > latest['sma10'] and prev['close'] < prev['sma10'] and trend_score < 0:
         analysis['exit_signals'].append('trend_reversal')
         print("Exit Signal: Trend reversal (bearish)")
-    if volatility_state == 'high' and abs(latest['roc']) > (df['roc'].std() * 2):
+    if volatility_state == 'high' and abs(latest['roc']) > (df['roc'].std() * ROC_VOLATILITY_MULTIPLIER):
         analysis['exit_signals'].append('volatility_spike')
         print("Exit Signal: Volatility spike")
+    
+    # Refined Momentum Loss
+    macd_hist_change = (latest['macd_hist'] - prev['macd_hist']) / abs(prev['macd_hist']) if prev['macd_hist'] != 0 else 0
+    if (momentum_score > 0 and macd_hist_change < -0.15 and latest['rsi'] < RSI_NEUTRAL_HIGH) or \
+       (momentum_score < 0 and macd_hist_change > 0.15 and latest['rsi'] > RSI_NEUTRAL_LOW):
+        analysis['exit_signals'].append('momentum_loss')
+        print("Exit Signal: Momentum loss")
+
+    # ENHANCED: Price-based exit signals
+    if latest['close'] < latest['sma5'] and prev['close'] > prev['sma5'] and trend_score > 0:
+        analysis['exit_signals'].append('short_term_trend_break')
+        print("Exit Signal: Short-term trend break")
+
+    # ENHANCED: Volume-based exit signals
+    if latest['volume_ratio'] < 0.5 and trend_score != 0:
+        analysis['exit_signals'].append('volume_decline')
+        print("Exit Signal: Volume decline")
+
+    # ENHANCED: Momentum divergence exit
+    price_higher = latest['close'] > prev['close']
+    momentum_lower = latest['rsi'] < prev['rsi']
+    if price_higher and momentum_lower and trend_score > 0:
+        analysis['exit_signals'].append('bullish_divergence')
+        print("Exit Signal: Bullish divergence")
+    elif not price_higher and not momentum_lower and trend_score < 0:
+        analysis['exit_signals'].append('bearish_divergence')
+        print("Exit Signal: Bearish divergence")
 
     return analysis
